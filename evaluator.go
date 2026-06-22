@@ -1,13 +1,13 @@
 package main
 
 import (
-	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"os"
 	"net/http"
 	"sync"
 	"time"
