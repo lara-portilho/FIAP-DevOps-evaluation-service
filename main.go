@@ -10,12 +10,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/go-redis/redis/extra/redisotel/v8"
 	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
-
-// Contexto global para o Redis
-var ctx = context.Background()
 
 // App struct para injeção de dependência
 type App struct {
@@ -29,6 +28,20 @@ type App struct {
 
 func main() {
 	_ = godotenv.Load() // Carrega .env para dev local
+	setupLogging()
+
+	ctx := context.Background()
+
+	// --- Telemetria (OpenTelemetry) ---
+	shutdownTelemetry, err := initTelemetry(ctx)
+	if err != nil {
+		log.Fatalf("Não foi possível inicializar o OpenTelemetry: %v", err)
+	}
+	defer func() {
+		if err := shutdownTelemetry(context.Background()); err != nil {
+			log.Printf("Erro ao finalizar o OpenTelemetry: %v", err)
+		}
+	}()
 
 	// --- Configuração ---
 	port := os.Getenv("PORT")
@@ -69,6 +82,7 @@ func main() {
 		log.Fatalf("Não foi possível parsear a URL do Redis: %v", err)
 	}
 	rdb := redis.NewClient(opt)
+	rdb.AddHook(redisotel.NewTracingHook())
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
 		log.Fatalf("Não foi possível conectar ao Redis: %v", err)
 	}
@@ -85,9 +99,15 @@ func main() {
 		log.Println("Cliente SQS inicializado com sucesso.")
 	}
 
-	// Cliente HTTP (com timeout)
+	// Cliente HTTP (com timeout). O transport do otelhttp cria o span CLIENT e
+	// injeta o traceparent nas chamadas ao flag-service e ao targeting-service.
 	httpClient := &http.Client{
-		Timeout: 5 * time.Second,
+		Timeout:   5 * time.Second,
+		Transport: otelhttp.NewTransport(http.DefaultTransport,
+			otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return r.Method + " " + r.URL.Host
+			}),
+		),
 	}
 
 	// Cria a instância da App
@@ -106,7 +126,7 @@ func main() {
 	mux.HandleFunc("/evaluate", app.evaluationHandler)
 
 	log.Printf("Serviço de Avaliação (Go) rodando na porta %s", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	if err := http.ListenAndServe(":"+port, instrumentHandler(mux)); err != nil {
 		log.Fatal(err)
 	}
 }

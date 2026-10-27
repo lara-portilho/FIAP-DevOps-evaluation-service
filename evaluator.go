@@ -1,17 +1,22 @@
 package main
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -20,19 +25,26 @@ const (
 )
 
 // getDecision é o wrapper principal
-func (a *App) getDecision(userID, flagName string) (bool, error) {
+func (a *App) getDecision(ctx context.Context, userID, flagName string) (bool, error) {
 	// 1. Obter os dados da flag (do cache ou dos serviços)
-	info, err := a.getCombinedFlagInfo(flagName)
+	info, err := a.getCombinedFlagInfo(ctx, flagName)
 	if err != nil {
 		return false, err
 	}
 
 	// 2. Executar a lógica de avaliação
-	return a.runEvaluationLogic(info, userID), nil
+	_, span := tracer.Start(ctx, "evaluate.run_logic")
+	defer span.End()
+	result := a.runEvaluationLogic(info, userID)
+	span.SetAttributes(attribute.Bool("evaluation.result", result))
+	return result, nil
 }
 
 // getCombinedFlagInfo busca os dados no Redis, com fallback para os microsserviços
-func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
+func (a *App) getCombinedFlagInfo(ctx context.Context, flagName string) (*CombinedFlagInfo, error) {
+	ctx, span := tracer.Start(ctx, "evaluate.get_flag_info", trace.WithAttributes(attribute.String("flag.name", flagName)))
+	defer span.End()
+
 	cacheKey := fmt.Sprintf("flag_info:%s", flagName)
 
 	// 1. Tentar buscar do Cache (Redis)
@@ -41,17 +53,20 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
 		// Cache HIT
 		var info CombinedFlagInfo
 		if err := json.Unmarshal([]byte(val), &info); err == nil {
-			log.Printf("Cache HIT para flag '%s'", flagName)
+			slog.InfoContext(ctx, "Cache HIT", "flag", flagName)
+			span.SetAttributes(attribute.Bool("cache.hit", true))
 			return &info, nil
 		}
 		// Se o unmarshal falhar, trata como cache miss
-		log.Printf("Erro ao desserializar cache para flag '%s': %v", flagName, err)
+		slog.WarnContext(ctx, "Erro ao desserializar cache", "flag", flagName, "error", err)
 	}
 	
-	log.Printf("Cache MISS para flag '%s'", flagName)
+	slog.InfoContext(ctx, "Cache MISS", "flag", flagName)
+	span.SetAttributes(attribute.Bool("cache.hit", false))
 	// 2. Cache MISS - Buscar dos serviços
-	info, err := a.fetchFromServices(flagName)
+	info, err := a.fetchFromServices(ctx, flagName)
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
@@ -59,7 +74,7 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
 	jsonData, err := json.Marshal(info)
 	if err == nil {
 		if err := a.RedisClient.Set(ctx, cacheKey, jsonData, CACHE_TTL).Err(); err != nil {
-			log.Printf("Erro ao salvar cache para flag '%s': %v", flagName, err)
+			slog.WarnContext(ctx, "Erro ao salvar cache", "flag", flagName, "error", err)
 		}
 	}
 
@@ -67,7 +82,7 @@ func (a *App) getCombinedFlagInfo(flagName string) (*CombinedFlagInfo, error) {
 }
 
 // fetchFromServices busca dados do flag-service e targeting-service concorrentemente
-func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
+func (a *App) fetchFromServices(ctx context.Context, flagName string) (*CombinedFlagInfo, error) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -78,13 +93,13 @@ func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
 	// Goroutine 1: Buscar do flag-service
 	go func() {
 		defer wg.Done()
-		flagInfo, flagErr = a.fetchFlag(flagName)
+		flagInfo, flagErr = a.fetchFlag(ctx, flagName)
 	}()
 
 	// Goroutine 2: Buscar do targeting-service
 	go func() {
 		defer wg.Done()
-		ruleInfo, ruleErr = a.fetchRule(flagName)
+		ruleInfo, ruleErr = a.fetchRule(ctx, flagName)
 	}()
 
 	wg.Wait()
@@ -93,7 +108,7 @@ func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
 		return nil, flagErr
 	}
 	if ruleErr != nil {
-		log.Printf("Aviso: Nenhuma regra de segmentação encontrada para '%s'. Usando padrão.", flagName)
+		slog.WarnContext(ctx, "Nenhuma regra de segmentação encontrada. Usando padrão.", "flag", flagName, "error", ruleErr)
 	}
 
 	return &CombinedFlagInfo{
@@ -103,11 +118,11 @@ func (a *App) fetchFromServices(flagName string) (*CombinedFlagInfo, error) {
 }
 
 // fetchFlag (função helper)
-func (a *App) fetchFlag(flagName string) (*Flag, error) {
+func (a *App) fetchFlag(ctx context.Context, flagName string) (*Flag, error) {
 	reqURL := fmt.Sprintf("%s/flags/%s", a.FlagServiceURL, url.PathEscape(flagName))
 
 	apiKey := os.Getenv("SERVICE_API_KEY")
-	req, _ := http.NewRequest("GET", reqURL, nil) // #nosec G704 -- host fixo (FlagServiceURL, config interna), path escapado com url.PathEscape
+	req, _ := http.NewRequestWithContext(ctx, "GET", reqURL, nil) // #nosec G704 -- host fixo (FlagServiceURL, config interna), path escapado com url.PathEscape
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := a.HttpClient.Do(req) // #nosec G704 -- ver justificativa acima
@@ -135,10 +150,10 @@ func (a *App) fetchFlag(flagName string) (*Flag, error) {
 	return &flag, nil
 }
 
-func (a *App) fetchRule(flagName string) (*TargetingRule, error) {
+func (a *App) fetchRule(ctx context.Context, flagName string) (*TargetingRule, error) {
 	reqURL := fmt.Sprintf("%s/rules/%s", a.TargetingServiceURL, url.PathEscape(flagName))
 	apiKey := os.Getenv("SERVICE_API_KEY") // Usa a mesma chave
-	req, _ := http.NewRequest("GET", reqURL, nil) // #nosec G704 -- host fixo (TargetingServiceURL, config interna), path escapado com url.PathEscape
+	req, _ := http.NewRequestWithContext(ctx, "GET", reqURL, nil) // #nosec G704 -- host fixo (TargetingServiceURL, config interna), path escapado com url.PathEscape
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := a.HttpClient.Do(req) // #nosec G704 -- ver justificativa acima
